@@ -12,28 +12,16 @@ namespace ExampleClient
         public string ExecutionId { get; set; }
         public string SequenceId { get; set; }
         
-        public int? PrevStepIndex { get; set; }
-        public string PrevStepName { get; set; }
-        public string PrevStepTypeName { get; set; }
-        public string PrevStepResultStatus { get; set; }
-
-        public int? CurrentStepIndex { get; set; }
-        public string CurrentStepName { get; set; }
-        public string CurrentStepTypeName { get; set; }
-        public string CurrentStepResultStatus { get; set; }
-        
-        public int? NextStepIndex { get; set; }
-        public string NextStepName { get; set; }
-        public string NextStepTypeName { get; set; }
-        public string NextStepResultStatus { get; set; }
-
-        public int LoopIterationNumber { get; set; } = -1;
+        public StepData PrevStep { get; set; }
+        public StepData CurrStep { get; set; }
+        public StepData NextStep { get; set; }
     }
 
-    internal class StepData
+    public class StepData
     {
+        public int StepIndex { get; set; } = -1;
         public string StepName { get; set; }
         public string StepTypeName { get; set; }
-        public string StepResultStatus { get; set; }
+        public string StepResultStatus { get; set; } = string.Empty;
     }
 }

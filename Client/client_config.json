@@ -8,6 +8,7 @@
         "server_cert": "server_self_signed_crt.pem"
     },
     "example_files": [
+        "GotoStepDemo.seq",
         "ForAndWait.seq",
         "Test.seq",
         "StepResults.seq",
