@@ -8,6 +8,7 @@ namespace NationalInstruments.TestStand.Grpc.Client.Utilities
     public class CreateChannelHelper : IDisposable
     {
 		public static event EventHandler<ValidateGrpcChannelEventArgs> ValidateGrpcChannel;
+
 		private X509Certificate2 _clientCertificate;
 		private X509Certificate2 _serverCertificate;
         private bool _disposedValue;

@@ -34,7 +34,7 @@
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <UseWindowsForms>true</UseWindowsForms>
     <ImportWindowsDesktopTargets>true</ImportWindowsDesktopTargets>
-	<Platforms>x86;x64</Platforms>
+	  <Platforms>x86;x64</Platforms>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x86' ">
     <OutputPath>bin\x86\Debug\</OutputPath>
@@ -75,6 +75,18 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\CommonFiles\GrpcServerBase.cs" Link="GrpcServerBase.cs" />
+    <Content Include="..\CommonFiles\server_config.json" Link="server_config.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="App.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\CommonFiles\certs\*.*" Link="certs\%(Filename)%(Extension)">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\ExampleFiles\*.seq" Link="ExampleFiles\%(Filename)%(Extension)">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <Reference Update="System">
@@ -89,45 +101,6 @@
     <Reference Update="System.Xml">
       <Name>System.XML</Name>
     </Reference>
-  </ItemGroup>
-  <ItemGroup>
-    <Content Include="..\CommonFiles\server_config.json" Link="server_config.json">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
-    <Content Include="App.ico" />
-  </ItemGroup>
-  <PropertyGroup />
-  <ItemGroup>
-    <None Include="..\CommonFiles\certs\client_self_signed_crt.pem" Link="certs\client_self_signed_crt.pem">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="..\CommonFiles\certs\server.pfx" Link="certs\server.pfx">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="..\CommonFiles\certs\server_privatekey.pem" Link="certs\server_privatekey.pem">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="..\CommonFiles\certs\server_self_signed_crt.pem" Link="certs\server_self_signed_crt.pem">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="..\ExampleFiles\LoadError.seq" Link="ExampleFiles\LoadError.seq">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="..\ExampleFiles\LoopForever.seq" Link="ExampleFiles\LoopForever.seq">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="..\ExampleFiles\RunTimeError.seq" Link="ExampleFiles\RunTimeError.seq">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="..\ExampleFiles\StepResults.seq" Link="ExampleFiles\StepResults.seq">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="..\ExampleFiles\Test.seq" Link="ExampleFiles\Test.seq">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="..\ExampleFiles\TraceExecution.seq" Link="ExampleFiles\TraceExecution.seq">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Grpc.AspNetCore" Version="2.48.0" />

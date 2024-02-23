@@ -13,6 +13,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Grpc.Core;
+using Microsoft.AspNetCore.Mvc.Diagnostics;
 using NationalInstruments.TestStand.API.Grpc; // TestStand Engine API
 using NationalInstruments.TestStand.Grpc.Client.Utilities;
 using NationalInstruments.TestStand.Grpc.Net.Client.OO;  // instance lifetime API
@@ -223,6 +224,7 @@ namespace ExampleClient
 					RefreshStationGlobals();
 				}
 
+				// enable execution tracing upon connection
 				_enableTracingCheckBox.Enabled = _isConnected;
 				_serverAddressTextBox.ReadOnly = _isConnected;
 				_serverAddressTextBox.BackColor = _serverAddressPanel.BackColor; // Keep the panel's background color when TextBox is read-only.
@@ -254,6 +256,7 @@ namespace ExampleClient
 		}
 
 		// pass false to onlyIfNeeded if the server address might have changed
+		// onlyIfNeeded = false means "absolutely needed"
 		private void Setup(bool onlyIfNeeded)
 		{
 			if (!onlyIfNeeded || !_clients.HasChannel)
@@ -267,7 +270,8 @@ namespace ExampleClient
 
 					InitializeProcessModelInformation();
 
-					_eventLoops.Add(HandleUIMessagesAsync());
+					// only one handler actually
+					_eventLoops.Add(HandleUIMessagesAsync()); // do not block/await since this is long-running task
 
 					InitializeEnableTracingOption();
 
@@ -288,7 +292,10 @@ namespace ExampleClient
 		private void Cleanup()
 		{
 			// exit all event streams
-			foreach (var cancellationTokenSource in from item in _eventLoops select item.Item2) cancellationTokenSource.Cancel();
+			foreach (var cancellationTokenSource in (from item in _eventLoops select item.Item2))
+			{
+				cancellationTokenSource.Cancel();
+			}
 
 			// wait for all event loop threads to exit
 			Task.WaitAll((from item in _eventLoops select item.Item1).ToArray(), 10000);
@@ -319,8 +326,11 @@ namespace ExampleClient
         {
             bool demoEventMessages = false;
 
+			// return "Error" string
             if (String.IsNullOrEmpty(_errorResultStatusConstant))
-                _errorResultStatusConstant = _clients.StepPropertiesClient.Get_ResultStatus_Error(new ConstantValueRequest()).ReturnValue;
+                _errorResultStatusConstant = _clients.StepPropertiesClient
+					.Get_ResultStatus_Error(new ConstantValueRequest())
+					.ReturnValue;
 
             var cancellationTokenSource = new System.Threading.CancellationTokenSource();
 
@@ -336,7 +346,8 @@ namespace ExampleClient
             var uiMessageEventStream = call.ResponseStream;
 			var threadCompletionSource = new TaskCompletionSource();
 
-			// read the message stream from a separate thread. Otherwise the asynchronous message reading loop would block whenever the thread in which it is established
+			// read the message stream from a separate thread.
+			// Otherwise the asynchronous message reading loop would block whenever the thread in which it is established
 			// blocks in a synchronous call, including synchronous gRPC calls. Because some TestStand gRPC API calls can generate events that require replies before completing
 			// the call, event loops should not be in a thread that might make non-async calls to the TestStand API, or any other calls that might block for an unbounded period.
 			Task.Factory.StartNew(() => 
@@ -347,7 +358,167 @@ namespace ExampleClient
             return new Tuple<Task, System.Threading.CancellationTokenSource>(threadCompletionSource.Task, cancellationTokenSource);
         }
 
-		private async Task HandleUiEventsAsync(
+		private async Task<ExecutionInstance> GetExecutionAsync(UIMessageInstance uiMessage)
+		{
+			return
+				(await _clients.UiMessageClient
+					.Get_ExecutionAsync(new UIMessage_Get_ExecutionRequest
+					{
+						Instance = uiMessage
+					})).ReturnValue;
+		}
+
+		private async Task<SequenceContextInstance> GetExecutionSequenceContextAsync(UIMessageInstance uiMessage)
+		{
+			var thread = (await _clients.UiMessageClient
+				.Get_ThreadAsync(new UIMessage_Get_ThreadRequest
+				{
+					Instance = uiMessage,
+				})).ReturnValue;
+			Debug.Assert(thread != null || thread.Id != "0");
+			if (thread.Id == "0")
+			{
+				thread = (await _clients.ExecutionClient
+					.Get_ForegroundThreadAsync(new Execution_Get_ForegroundThreadRequest
+					{
+						Instance = await GetExecutionAsync(uiMessage)
+					})).ReturnValue;
+			}
+
+			var seqContext = (await _clients.ThreadClient
+				.GetSequenceContextAsync(new Thread_GetSequenceContextRequest
+				{
+					Instance = thread,
+					CallStackIndex = 0,
+				})).ReturnValue;
+			Debug.Assert(seqContext != null);
+
+			return seqContext;
+		}
+
+		private async Task<ExecutionMessageEventData> GetExecutionEventDataAsync(UIMessageInstance uiMessage)
+		{
+			try
+			{
+                var execution = await GetExecutionAsync(uiMessage);
+				var seqContext = await GetExecutionSequenceContextAsync(uiMessage);
+
+				var executionSeq = (await _clients.SequenceContextClient
+					.Get_SequenceAsync(new SequenceContext_Get_SequenceRequest
+					{
+						Instance = seqContext
+					})).ReturnValue;
+				Debug.Assert(executionSeq != null);
+
+				var executionData = new ExecutionMessageEventData
+				{
+					ExecutionId = execution.Id,
+					SequenceId = executionSeq.Id,
+				};
+
+				executionData.LoopIterationNumber = (await _clients.SequenceContextClient
+					.Get_LoopNumIterationsAsync(new SequenceContext_Get_LoopNumIterationsRequest
+					{
+						Instance = seqContext,
+					})).ReturnValue;
+
+				executionData.PrevStepIndex = (await _clients.SequenceContextClient
+					.Get_PreviousStepIndexAsync(new SequenceContext_Get_PreviousStepIndexRequest
+					{
+						Instance = seqContext
+					})).ReturnValue;
+
+				if (executionData.PrevStepIndex >= 0)
+                {
+                    var prevStep = (await _clients.SequenceContextClient
+                        .Get_PreviousStepAsync(new SequenceContext_Get_PreviousStepRequest
+                        {
+                            Instance = seqContext
+                        })).ReturnValue;
+                    Debug.Assert(prevStep != null);
+
+                    var stepData = await GetStepDataAsync(prevStep);
+					executionData.PrevStepName = stepData.StepName;
+					executionData.PrevStepTypeName = stepData.StepTypeName;
+					executionData.PrevStepResultStatus = stepData.StepResultStatus;
+                }
+                executionData.CurrentStepIndex = (await _clients.SequenceContextClient
+					.Get_StepIndexAsync(new SequenceContext_Get_StepIndexRequest
+					{
+						Instance = seqContext
+					})).ReturnValue;
+				if (executionData.CurrentStepIndex > 0)
+				{
+					var currentStep = (await _clients.SequenceContextClient
+						.Get_StepAsync(new SequenceContext_Get_StepRequest
+						{
+							Instance = seqContext
+						})).ReturnValue;
+					Debug.Assert(currentStep != null);
+
+					var stepData = await GetStepDataAsync(currentStep);
+					executionData.CurrentStepName = stepData.StepName;
+					executionData.CurrentStepTypeName = stepData.StepTypeName;
+					executionData.CurrentStepResultStatus = stepData.StepResultStatus;
+				}
+
+				executionData.NextStepIndex = (await _clients.SequenceContextClient
+					.Get_NextStepIndexAsync(new SequenceContext_Get_NextStepIndexRequest
+					{
+						Instance = seqContext
+					})).ReturnValue;
+				if (executionData.NextStepIndex >= 0)
+				{
+					var nextStep = (await _clients.SequenceContextClient
+						.Get_NextStepAsync(new SequenceContext_Get_NextStepRequest
+						{
+							Instance = seqContext
+						})).ReturnValue;
+					Debug.Assert(nextStep != null);
+
+					var stepData = await GetStepDataAsync(nextStep);
+					executionData.NextStepName = stepData.StepName;
+					executionData.NextStepTypeName = stepData.StepTypeName;
+					executionData.NextStepResultStatus = stepData.StepResultStatus;
+				}
+
+				return executionData;
+            }
+            catch (RpcException ex)
+            {
+                throw ex;
+            }
+        }
+
+        private async Task<StepData> GetStepDataAsync(StepInstance prevStep)
+        {
+			var stepData = new StepData();
+
+            stepData.StepName = (await _clients.StepClient
+                .Get_NameAsync(new Step_Get_NameRequest
+                {
+                    Instance = prevStep
+                })).ReturnValue;
+            var stepType = (await _clients.StepClient
+                .Get_StepTypeAsync(new Step_Get_StepTypeRequest
+                {
+                    Instance = prevStep
+                })).ReturnValue;
+            stepData.StepTypeName = (await _clients.StepTypeClient
+                .Get_NameAsync(new StepType_Get_NameRequest
+                {
+                    Instance = stepType
+                })).ReturnValue;
+            stepData.StepResultStatus = (await _clients.StepClient
+                .Get_ResultStatusAsync(new Step_Get_ResultStatusRequest
+                {
+                    Instance = prevStep
+                })).ReturnValue;
+
+			return stepData;
+        }
+
+        private async Task HandleUiEventsAsync(
 			bool demoEventMessages,
 			AsyncServerStreamingCall<Engine_GetEvents_UIMessageEventResponse> call,
 			IAsyncStreamReader<Engine_GetEvents_UIMessageEventResponse> uiMessageEventStream,
@@ -375,59 +546,170 @@ namespace ExampleClient
 						LogLine($"received msg id {uiMessageEvent.Msg.Id}  eventId: {uiMessageEvent.EventId}");
 					}
 
-					// Only process UI messages if there is an active execution.
-					if (activeExecution != null)
-					{
-						UIMessage_Get_ExecutionResponse response = await _clients.UiMessageClient.Get_ExecutionAsync(new UIMessage_Get_ExecutionRequest
+                    uiMessageCode = _clients.UiMessageClient
+						.Get_Event(new UIMessage_Get_EventRequest
 						{
 							Instance = uiMessageEvent.Msg
-						});
-						ExecutionInstance executionInstance = response.ReturnValue;
-						uiMessageCode = _clients.UiMessageClient.Get_Event(new UIMessage_Get_EventRequest { Instance = uiMessageEvent.Msg }).ReturnValue;
+						}).ReturnValue;
+                    LogTraceMessage($"Received msg id {uiMessageEvent.Msg.Id}  eventId: {uiMessageEvent.EventId} -- msg: {uiMessageCode}\n");
 
+                    // Only process UI messages if there is an active execution.
+                    if (activeExecution != null)
+					{
 						switch (uiMessageCode)
 						{
+							case UIMessageCodes.UimsgStartFileExecution:
+								{
+									// ActiveXData has the seq file path
+									string seqFileId = (await _clients.UiMessageClient
+										.Get_ActiveXDataAsync(new UIMessage_Get_ActiveXDataRequest
+										{
+											Instance = uiMessageEvent.Msg
+										}))
+										.ReturnValue.Id;
+									string seqFilePath = (await _clients.PropertyObjectFileClient
+										.Get_PathAsync(new PropertyObjectFile_Get_PathRequest
+										{
+											Instance = new PropertyObjectFileInstance { Id = seqFileId }
+										})).ReturnValue;
+									LogTraceMessage($"Start File Execution: {seqFilePath}" + Environment.NewLine);
+								}
+								break;
+							case UIMessageCodes.UimsgEndFileExecution:
+								{
+                                    // ActiveXData has the seq file path
+                                    string seqFileId = (await _clients.UiMessageClient
+                                        .Get_ActiveXDataAsync(new UIMessage_Get_ActiveXDataRequest
+                                        {
+                                            Instance = uiMessageEvent.Msg
+                                        }))
+                                        .ReturnValue.Id;
+                                    string seqFilePath = (await _clients.PropertyObjectFileClient
+                                        .Get_PathAsync(new PropertyObjectFile_Get_PathRequest
+                                        {
+                                            Instance = new PropertyObjectFileInstance { Id = seqFileId }
+                                        })).ReturnValue;
+                                    LogTraceMessage($"End File Execution: {seqFilePath}" + Environment.NewLine);
+                                }
+                                break;
 							case UIMessageCodes.UimsgStartExecution:
 								{
-									// Parallel and Batch process models create new executions for the test sockets. Those execution need to be traced.
-									// Since the executions can take time to start and there is not enough information to determine execution hierarchy
-									// (there is no parent execution property on an execution object), the first executions up to the total number of
-									// test sockets expected will be treated as the socket executions for the process model.
-									// This approach will not work in all cases. If one of the sockets starts a new execution before a new socket is 
-									// started, the new execution will be treated as one of the sockets which is not correct.
-									// More elaborated approaches can be made by looking at model data to determine the execution information,
-									// but it will require more calls and it will be tied to a process model implementation.
-									if (_executionIdsToTrace.Count < _numberOfTestSocketsExecuting)
+									// step info isn't ready at this event
+									//var eventData = await GetExecutionEventDataAsync(uiMessageEvent.Msg);
+									var eventData = new ExecutionMessageEventData();
+									eventData.ExecutionId = (await GetExecutionAsync(uiMessageEvent.Msg)).Id;
+
+									var seqFile = (await _clients.ExecutionClient
+										.Get_SequenceFilePathAsync(new Execution_Get_SequenceFilePathRequest
+										{
+											Instance = new ExecutionInstance { Id = eventData.ExecutionId }
+										})).ReturnValue;
+
+                                    LogLine("Start Execution Message");
+                                    LogTraceMessage($"Execution Start: active execution:{activeExecution.Id}, event execution: {eventData.ExecutionId}\n");
+									LogTraceMessage($"Seq File: {seqFile}\n");
+                                    LogTraceMessage($"Prev step: {eventData.PrevStepIndex}, {eventData.PrevStepName ?? ""}, {eventData.PrevStepResultStatus ?? ""}\n");
+                                    LogTraceMessage($"Curr step: {eventData.CurrentStepIndex}, {eventData.CurrentStepName}\n");
+                                    LogTraceMessage($"Next step: {eventData.NextStepIndex}, {eventData.NextStepName}\n");
+
+                                    // Parallel and Batch process models create new executions for the test sockets. Those execution need to be traced.
+                                    // Since the executions can take time to start and there is not enough information to determine execution hierarchy
+                                    // (there is no parent execution property on an execution object), the first executions up to the total number of
+                                    // test sockets expected will be treated as the socket executions for the process model.
+                                    // This approach will not work in all cases. If one of the sockets starts a new execution before a new socket is 
+                                    // started, the new execution will be treated as one of the sockets which is not correct.
+                                    // More elaborated approaches can be made by looking at model data to determine the execution information,
+                                    // but it will require more calls and it will be tied to a process model implementation.
+                                    if (_executionIdsToTrace.Count < _numberOfTestSocketsExecuting)
 									{
-										_executionIdsToTrace.Add(executionInstance.Id);
+										_executionIdsToTrace.Add(eventData.ExecutionId);
 									}
 								}
 								break;
 							case UIMessageCodes.UimsgEndExecution:
 								{
-									bool traceExecution = _executionIdsToTrace.Contains(executionInstance.Id);
-									if (traceExecution)
+									// the execution thread/Sequence-Contxt has gone at this point
+                                    var executionInstance = await GetExecutionAsync(uiMessageEvent.Msg);
+
+                                    LogLine("End Execution Message");
+                                    LogTraceMessage($"Execution End: active execution:{activeExecution.Id}, event execution: {executionInstance.Id}\n");
+
+									string seqFilePath = (await _clients.ExecutionClient
+										.Get_SequenceFilePathAsync(new Execution_Get_SequenceFilePathRequest
+										{
+											Instance = executionInstance
+										})).ReturnValue;
+
+									// execution thread has gone - so as sequence context
+                                    //var eventData = await GetExecutionEventDataAsync(uiMessageEvent.Msg);
+                                    //LogTraceMessage($"Execution End: active execution:{activeExecution.Id}, event execution: {eventData.ExecutionId}\n");
+                                    //LogTraceMessage($"Prev step: {eventData.PrevStepIndex}, {eventData.PrevStepName ?? ""}, {eventData.PrevStepResultStatus ?? ""}\n");
+                                    //LogTraceMessage($"Curr step: {eventData.CurrentStepIndex}, {eventData.CurrentStepName}\n");
+                                    //LogTraceMessage($"Next step: {eventData.NextStepIndex}, {eventData.NextStepName}\n");
+
+                                    bool traceExecution = _executionIdsToTrace.Contains(executionInstance.Id);
+									//if (traceExecution)
 									{
-										var executionId = (await _clients.ExecutionClient.Get_IdAsync(new Execution_Get_IdRequest { Instance = executionInstance })).ReturnValue;
+										// this isn't the same id as the one in the eventExecutionInstance
+										var executionId = (await _clients.ExecutionClient
+											.Get_IdAsync(new Execution_Get_IdRequest
+											{
+												Instance = executionInstance
+											})).ReturnValue;
 
 										// Log the end of an execution only if tracing is enabled.
 										if (_enableTracingCheckBox.Checked)
 										{
 											LogTraceMessage(Invariant($"Execution with id '{executionId}' is done running.") + Environment.NewLine);
 										}
+                                        LogTraceMessage($"Execution Ended: active execution:{activeExecution.Id}, event execution: {executionInstance.Id}\n");
+										LogTraceMessage($"Seq File: {seqFilePath}");
 
-										ReportInstance report = _clients.ExecutionClient.Get_Report(new Execution_Get_ReportRequest { Instance = executionInstance }).ReturnValue;
+                                        ReportInstance report = _clients.ExecutionClient
+											.Get_Report(new Execution_Get_ReportRequest 
+											{
+												Instance = executionInstance
+											}).ReturnValue;
 										string reportPath = _clients.ReportClient.Get_Location(new Report_Get_LocationRequest { Instance = report }).ReturnValue;
 										if (!string.IsNullOrEmpty(reportPath))
 										{
+											LogLine($"Report on server: {reportPath}");
 											_reportLocationsOnServer.Add(reportPath);
 										}
 									}
 								}
 								break;
+							case UIMessageCodes.UimsgBreakOnUserRequest:
+								{
+									var eventData = await GetExecutionEventDataAsync(uiMessageEvent.Msg);
+
+									LogLine("Execution Paused");
+                                    LogTraceMessage($"Pause Execution: active execution:{activeExecution.Id}, event execution: {eventData.ExecutionId}\n");
+									LogMessageStepData(eventData);
+									LogTraceMessage("\n");
+                                }
+                                break;
+							case UIMessageCodes.UimsgResumeFromBreak:
+                                {
+                                    var eventData = await GetExecutionEventDataAsync(uiMessageEvent.Msg);
+
+                                    LogLine("Execution Resumed");
+                                    LogTraceMessage($"Resume Execution: active execution:{activeExecution.Id}, event execution: {eventData.ExecutionId}\n");
+                                    LogMessageStepData(eventData);
+                                    LogTraceMessage("\n");
+                                }
+                                break;
 							case UIMessageCodes.UimsgTrace:
 								{
-									bool traceExecution = _executionIdsToTrace.Contains(executionInstance.Id);
+                                    var eventData = await GetExecutionEventDataAsync(uiMessageEvent.Msg);
+
+                                    // execution has reached a trace point - what is a trace point?
+                                    LogLine("Execution Trace Message");
+                                    LogTraceMessage($"Trace Execution: active execution:{activeExecution.Id}, event execution: {eventData.ExecutionId}\n");
+									LogMessageStepData(eventData);
+                                    LogTraceMessage("\n");
+
+                                    bool traceExecution = _executionIdsToTrace.Contains(eventData.ExecutionId);
 									int numberOfTestSocketsExecuting = _numberOfTestSocketsExecuting;
 
 									// Only process the trace messages of the executions that we know of.
@@ -435,18 +717,19 @@ namespace ExampleClient
 									{
 										string message = string.Empty;
 
-										var threadInstance = _clients.UiMessageClient.Get_Thread(new UIMessage_Get_ThreadRequest { Instance = uiMessageEvent.Msg }).ReturnValue;
-										var sequenceContextInstance = _clients.ThreadClient.GetSequenceContext(new Thread_GetSequenceContextRequest { Instance = threadInstance, CallStackIndex = 0 }).ReturnValue;
-										var sequenceContextPropertyObjectInstance = new PropertyObjectInstance { Id = sequenceContextInstance.Id };
-										var previousStepIndex = _clients.SequenceContextClient.Get_PreviousStepIndex(new SequenceContext_Get_PreviousStepIndexRequest { Instance = sequenceContextInstance }).ReturnValue;
+										// UIMessage data structure:
+										// https://www.ni.com/docs/en-US/bundle/teststand/page/tsapiref/reftopics/uimessage.htm
 
-										if (previousStepIndex >= 0)
+										var seqContext = await GetExecutionSequenceContextAsync(uiMessageEvent.Msg);
+
+										// previous step is the step that just completed
+										if (eventData.PrevStepIndex >= 0)
 										{
 											if (numberOfTestSocketsExecuting > 1)
 											{
 												int socketNumber = (int)_clients.PropertyObjectClient.GetValNumber(new PropertyObject_GetValNumberRequest
 												{
-													Instance = sequenceContextPropertyObjectInstance,
+													Instance = new PropertyObjectInstance { Id = seqContext.Id },
 													LookupString = "Runstate.TestSockets.MyIndex",
 													Options = PropertyOptions.PropOptionNoOptions
 												}).ReturnValue;
@@ -455,17 +738,22 @@ namespace ExampleClient
 												message = Invariant($"Socket {socketNumber,-2}  ");
 											}
 
-											var previousStepInstance = (await _clients.SequenceContextClient.Get_PreviousStepAsync(new SequenceContext_Get_PreviousStepRequest { Instance = sequenceContextInstance })).ReturnValue;
-											var stepName = (await _clients.StepClient.Get_NameAsync(new Step_Get_NameRequest { Instance = previousStepInstance })).ReturnValue;
-											var status = (await _clients.StepClient.Get_ResultStatusAsync(new Step_Get_ResultStatusRequest { Instance = previousStepInstance })).ReturnValue;
+											var previousStepInstance = (await _clients.SequenceContextClient
+												.Get_PreviousStepAsync(new SequenceContext_Get_PreviousStepRequest
+												{
+													Instance = seqContext
+												})).ReturnValue;
 
 											// Make status 7 characters long and left aligned it.
-											string statusFormatted = string.Format("{0,-" + StatusLength + "}", status);
-											message += Invariant($"{statusFormatted}  Step {stepName}");
+											string statusFormatted = string.Format("{0,-" + StatusLength + "}", eventData.PrevStepResultStatus);
+											message += Invariant($"{statusFormatted}  Step {eventData.PrevStepName}");
 
-											if (status == _errorResultStatusConstant)
+											if (eventData.PrevStepResultStatus == _errorResultStatusConstant)
 											{
-												var stepObj = new PropertyObjectInstance { Id = previousStepInstance.Id }; // no need to call AsPropertyObject, just use the same Id and save a round trip
+												var stepObj = new PropertyObjectInstance 
+												{
+													Id = previousStepInstance.Id
+												}; // no need to call AsPropertyObject, just use the same Id and save a round trip
 												var errorCode = (await _clients.PropertyObjectClient.GetValNumberAsync(new PropertyObject_GetValNumberRequest { Instance = stepObj, LookupString = "Result.Error.Code", Options = PropertyOptions.PropOptionNoOptions })).ReturnValue;
 												var errorMessage = (await _clients.PropertyObjectClient.GetValStringAsync(new PropertyObject_GetValStringRequest { Instance = stepObj, LookupString = "Result.Error.Msg", Options = PropertyOptions.PropOptionNoOptions })).ReturnValue;
 
@@ -476,15 +764,88 @@ namespace ExampleClient
 												message += Invariant($"{indentedCodeLabel} {errorCode}  Message {errorMessage}");
 											}
 
-											LogTraceMessage(message + Environment.NewLine);
-										}
-									}
+                                        }
+                                        
+										LogTraceMessage(message + Environment.NewLine);
+                                    }
+								}
+								break;
+							case UIMessageCodes.UimsgRuntimeError:
+								{
+                                    var eventData = await GetExecutionEventDataAsync(uiMessageEvent.Msg);
+
+                                    LogTraceMessage("Runtime Error" + Environment.NewLine);
+                                    LogTraceMessage($"Execution: active execution:{activeExecution.Id}, event execution: {eventData.ExecutionId}\n");
+
+                                    bool traceExecution = _executionIdsToTrace.Contains(eventData.ExecutionId);
+
+                                    // Only process the trace messages of the executions that we know of.
+                                    if (traceExecution)
+                                    {
+                                        string message = string.Empty;
+                                        var seqContext = await GetExecutionSequenceContextAsync(uiMessageEvent.Msg);
+
+                                        if (eventData.PrevStepIndex >= 0)
+                                        {
+                                            var previousStepInstance = (await _clients.SequenceContextClient
+                                                .Get_PreviousStepAsync(new SequenceContext_Get_PreviousStepRequest
+                                                {
+                                                    Instance = seqContext
+                                                })).ReturnValue;
+
+                                            // Make status 7 characters long and left aligned it.
+                                            string statusFormatted = string.Format("{0,-" + StatusLength + "}", eventData.PrevStepResultStatus);
+                                            message += Invariant($"{statusFormatted}  Step {eventData.PrevStepName ?? ""}");
+
+                                            if (eventData.PrevStepResultStatus == _errorResultStatusConstant)
+                                            {
+                                                var stepObj = new PropertyObjectInstance { Id = previousStepInstance.Id }; // no need to call AsPropertyObject, just use the same Id and save a round trip
+                                                var errorCode = (await _clients.PropertyObjectClient
+													.GetValNumberAsync(new PropertyObject_GetValNumberRequest 
+													{
+														Instance = stepObj,
+														LookupString = "Result.Error.Code",
+														Options = PropertyOptions.PropOptionNoOptions
+													})).ReturnValue;
+                                                var errorMessage = (await _clients.PropertyObjectClient
+													.GetValStringAsync(new PropertyObject_GetValStringRequest
+													{
+														Instance = stepObj, 
+														LookupString = "Result.Error.Msg", 
+														Options = PropertyOptions.PropOptionNoOptions
+													})).ReturnValue;
+
+                                                // Indent the Code label below the Step label
+                                                int codeStartingIndex = message.IndexOf("Step") + IndentOffset;
+                                                string indentedCodeLabel = string.Format("\n{0," + codeStartingIndex + "}Code", "");
+
+                                                message += Invariant($"{indentedCodeLabel} {errorCode}  Message {errorMessage}");
+                                            }
+
+                                            LogTraceMessage(message + Environment.NewLine);
+
+                                        }
+                                    }
+                                }
+                                break;
+							case UIMessageCodes.UimsgAbortingExecution:
+								{
+
+								}
+								break;
+							case UIMessageCodes.UimsgTerminatingExecution:
+								{
+
 								}
 								break;
 						}
 					}
 
-					_ = _clients.EngineClient.ReplyToEvent_UIMessageEventAsync(new Engine_ReplyToEvent_UIMessageEventRequest { EventId = uiMessageEvent.EventId });
+					_ = _clients.EngineClient
+						.ReplyToEvent_UIMessageEventAsync(new Engine_ReplyToEvent_UIMessageEventRequest
+						{
+							EventId = uiMessageEvent.EventId
+						});
 
 					if (demoEventMessages)
 					{
@@ -494,7 +855,7 @@ namespace ExampleClient
 				}
 
 				LogLine("The UIMessage event stream exited without an error.");
-
+				
 			}
 			catch (RpcException rpcException)
 			{
@@ -505,19 +866,27 @@ namespace ExampleClient
 				}
 				else
 				{
-					LogLine("The UIMessage event stream exited with an error: " + rpcException.Message);
+					LogLine("RpcException: The UIMessage event stream exited with an error: " + rpcException.Message);
 				}
 			}
 			catch (Exception exception)
 			{
-				LogLine("The UIMessage event stream exited with an error: " + exception.Message);
+				LogLine("Exception: The UIMessage event stream exited with an error: " + exception.Message);
 			}
 
 			call.Dispose(); // cancels the call, in case we exited with an error
 			threadCompletionTokenSource.SetResult();
 		}
 
-		private void GetEngineReference()
+        private void LogMessageStepData(ExecutionMessageEventData eventData)
+        {
+            LogTraceMessage($"Prev step: Index = {eventData.PrevStepIndex}, Name = {eventData.PrevStepName ?? ""}, Type = {eventData.PrevStepTypeName}, Status = {eventData.PrevStepResultStatus ?? ""}\n");
+            LogTraceMessage($"Curr step: Index = {eventData.CurrentStepIndex}, Name = {eventData.CurrentStepName ?? ""}, Type = {eventData.CurrentStepTypeName ?? ""}, Status = {eventData.CurrentStepResultStatus ?? ""}\n");
+            LogTraceMessage($"Next step: Index = {eventData.NextStepIndex}, Name = {eventData.NextStepName ?? ""} Type = {eventData.NextStepTypeName ?? ""}, Status = {eventData.NextStepResultStatus ?? ""}\n");
+            LogTraceMessage($"LoopIndex: {eventData.LoopIterationNumber}\n");
+        }
+
+        private void GetEngineReference()
 		{
 			if (_engine == null)
 			{
@@ -535,6 +904,7 @@ namespace ExampleClient
 		private void InitializeProcessModelInformation()
 		{
 			// Initialize the process model MRU list
+			// Get all supported process models
 			PropertyObjectFileInstance configFile = _clients.EngineClient.GetEngineConfigFile(
 				new Engine_GetEngineConfigFileRequest
 				{
@@ -602,7 +972,12 @@ namespace ExampleClient
 
 		private StationOptionsInstance GetStationOptions()
 		{
-			return _clients.EngineClient.Get_StationOptions(new Engine_Get_StationOptionsRequest { Instance = _engine }).ReturnValue;
+			return _clients.EngineClient
+				.Get_StationOptions(new Engine_Get_StationOptionsRequest 
+				{
+					Instance = _engine
+				})
+				.ReturnValue;
 		}
 
 		private int GetMultipleUUTSettingsNumberOfTestSocketsOption()
@@ -1184,6 +1559,7 @@ namespace ExampleClient
 			try
 			{
 				_activeExecutionCancellationTokenSource = new CancellationTokenSource();
+				// wait for execution run to finish
 				await _clients.ExecutionClient.WaitForEndExAsync(new Execution_WaitForEndExRequest
 				{
 					Instance = _activeExecution,
@@ -1238,17 +1614,36 @@ namespace ExampleClient
             }
 
 			// ModelData is a local variable in the root context.
-			ThreadInstance thread = _clients.ExecutionClient.GetThread(new Execution_GetThreadRequest { Instance = execution, Index = 0 }).ReturnValue;
-			SequenceContextInstance currentContext = _clients.ThreadClient.GetSequenceContext(new Thread_GetSequenceContextRequest { Instance = thread, CallStackIndex = 0 }).ReturnValue;
-			SequenceContextInstance rootContext = _clients.SequenceContextClient.Get_Root(new SequenceContext_Get_RootRequest { Instance = currentContext }).ReturnValue;
-			PropertyObjectInstance locals = _clients.SequenceContextClient.Get_Locals(new SequenceContext_Get_LocalsRequest { Instance = rootContext }).ReturnValue;
+			ThreadInstance thread = _clients.ExecutionClient
+				.GetThread(new Execution_GetThreadRequest
+				{
+					Instance = execution,
+					Index = 0
+				}).ReturnValue;
+			SequenceContextInstance currentContext = _clients.ThreadClient
+				.GetSequenceContext(new Thread_GetSequenceContextRequest
+				{
+					Instance = thread,
+					CallStackIndex = 0
+				}).ReturnValue;
+			SequenceContextInstance rootContext = _clients.SequenceContextClient
+				.Get_Root(new SequenceContext_Get_RootRequest
+				{
+					Instance = currentContext
+				}).ReturnValue;
+			PropertyObjectInstance locals = _clients.SequenceContextClient
+				.Get_Locals(new SequenceContext_Get_LocalsRequest
+				{
+					Instance = rootContext
+				}).ReturnValue;
 				
-			PropertyObjectInstance modelData = _clients.PropertyObjectClient.GetPropertyObject(new PropertyObject_GetPropertyObjectRequest
-			{
-				Instance = locals,
-				LookupString = "ModelData",
-				Options = PropertyOptions.PropOptionNoOptions
-			}).ReturnValue;
+			PropertyObjectInstance modelData = _clients.PropertyObjectClient
+				.GetPropertyObject(new PropertyObject_GetPropertyObjectRequest
+				{
+					Instance = locals,
+					LookupString = "ModelData",
+					Options = PropertyOptions.PropOptionNoOptions
+				}).ReturnValue;
 
 			return modelData;
         }
@@ -1331,9 +1726,9 @@ namespace ExampleClient
 				LogFaded("Report location(s) on server:\n");
 				foreach (string reportPath in _reportLocationsOnServer)
 				{
-				LogLine(reportPath + Environment.NewLine);
+					LogLine(reportPath + Environment.NewLine);
+				}
 			}
-		}
 		}
 
 		private int DisplayResultsForBatchOrParallelModelRuns(PropertyObjectInstance modelData, string modelName)
@@ -1647,6 +2042,7 @@ namespace ExampleClient
 				activeExecution = _activeExecution;
 			}
 
+			// states of the active execution
 			if (activeExecution != null)
 			{
 				var states = await _clients.ExecutionClient.GetStatesAsync(new Execution_GetStatesRequest { Instance = activeExecution });
@@ -1663,6 +2059,7 @@ namespace ExampleClient
 					}
 				}
 
+				// a.k.a pauseEnabled
 				breakEnabled = states.RunState == ExecutionRunStates.ExecRunStateRunning;
 				resumeEnabled = states.RunState == ExecutionRunStates.ExecRunStatePaused;
 				terminateEnabled = states.RunState != ExecutionRunStates.ExecRunStateStopped;
@@ -1677,16 +2074,28 @@ namespace ExampleClient
 					}
 					else
 					{
-					var mainExecutionThread = _clients.ExecutionClient.Get_ForegroundThread(new Execution_Get_ForegroundThreadRequest { Instance = activeExecution }).ReturnValue;
-					var sequenceContext = _clients.ThreadClient.GetSequenceContext(new Thread_GetSequenceContextRequest { Instance = mainExecutionThread, CallStackIndex = 0 }).ReturnValue;
-					var nextStepIndex = _clients.SequenceContextClient.Get_NextStepIndex(new SequenceContext_Get_NextStepIndexRequest { Instance = sequenceContext }).ReturnValue;
-					if (nextStepIndex >= 0)
-					{
-						var step = _clients.SequenceContextClient.Get_NextStep(new SequenceContext_Get_NextStepRequest { Instance = sequenceContext }).ReturnValue;
-						suspendedAtStepName = _clients.StepClient.Get_Name(new Step_Get_NameRequest { Instance = step }).ReturnValue;
+						var mainExecutionThread = _clients.ExecutionClient
+							.Get_ForegroundThread(new Execution_Get_ForegroundThreadRequest 
+							{
+								Instance = activeExecution 
+							}).ReturnValue;
+						var sequenceContext = _clients.ThreadClient
+							.GetSequenceContext(new Thread_GetSequenceContextRequest 
+							{
+								Instance = mainExecutionThread, CallStackIndex = 0 
+							}).ReturnValue;
+						var nextStepIndex = _clients.SequenceContextClient
+							.Get_NextStepIndex(new SequenceContext_Get_NextStepIndexRequest 
+							{
+								Instance = sequenceContext 
+							}).ReturnValue;
+						if (nextStepIndex >= 0)
+						{
+							var step = _clients.SequenceContextClient.Get_NextStep(new SequenceContext_Get_NextStepRequest { Instance = sequenceContext }).ReturnValue;
+							suspendedAtStepName = _clients.StepClient.Get_Name(new Step_Get_NameRequest { Instance = step }).ReturnValue;
+						}
 					}
 				}
-			}
 			}
 
 			_suspendedAtStepTextBox.Text = suspendedAtStepName;
@@ -1919,7 +2328,7 @@ namespace ExampleClient
 				var execution = _clients.ThreadClient.Get_Execution(new Thread_Get_ExecutionRequest { Instance = threadInstance }).ReturnValue;
 				threadInfo.ParentControllerThreadId = _clients.ThreadClient.Get_Id(new Thread_Get_IdRequest { Instance = threadInstance }).ReturnValue;
 				threadInfo.ParentControllerExecutionId = _clients.ExecutionClient.Get_Id(new Execution_Get_IdRequest { Instance = execution }).ReturnValue;
-			}				
+			}
 		}
 
 		private void ListExecutionsAndThreads()
@@ -1960,6 +2369,7 @@ namespace ExampleClient
         {
 			var executionInstances = new List<ExecutionInfo>();
 
+			// no active execution
 			if (_activeExecution == null)
 			{
 				return executionInstances;
@@ -1967,14 +2377,31 @@ namespace ExampleClient
 
 			ExecutionsInstance executions = GetAllOpenExecutions();
 
-			var numberOfExecutions = _clients.ExecutionsClient.Get_Count(new Executions_Get_CountRequest { Instance = executions }).ReturnValue;
-			int activeExecutionId = _clients.ExecutionClient.Get_Id(new Execution_Get_IdRequest { Instance = _activeExecution }).ReturnValue;
+			var numberOfExecutions = _clients.ExecutionsClient
+				.Get_Count(new Executions_Get_CountRequest
+				{
+					Instance = executions
+				}).ReturnValue;
+			int activeExecutionId = _clients.ExecutionClient
+				.Get_Id(new Execution_Get_IdRequest
+				{
+					Instance = _activeExecution
+				}).ReturnValue;
 
 			// For each execution, check if the id or the parent execution id matches the active execution.
 			for (int executionIndex = 0; executionIndex < numberOfExecutions; executionIndex++)
 			{
-				var execution = _clients.ExecutionsClient.Get_Item(new Executions_Get_ItemRequest { Instance = executions, ItemIdx = executionIndex }).ReturnValue;
-				var numberOfThreads = _clients.ExecutionClient.Get_NumThreads(new Execution_Get_NumThreadsRequest { Instance = execution }).ReturnValue;
+				var execution = _clients.ExecutionsClient
+					.Get_Item(new Executions_Get_ItemRequest
+					{
+						Instance = executions,
+						ItemIdx = executionIndex 
+					}).ReturnValue;
+				var numberOfThreads = _clients.ExecutionClient
+					.Get_NumThreads(new Execution_Get_NumThreadsRequest
+					{
+						Instance = execution
+					}).ReturnValue;
 
 				// If the number of threads is zero, it means the execution has completed so skip it.
 				if (numberOfThreads == 0)
@@ -1991,7 +2418,12 @@ namespace ExampleClient
 				if (!executionStartedByClient)
 				{
 					// Get the thread info which includes the execution parent id
-					var thread = _clients.ExecutionClient.GetThread(new Execution_GetThreadRequest { Instance = execution, Index = 0 }).ReturnValue;
+					var thread = _clients.ExecutionClient
+						.GetThread(new Execution_GetThreadRequest
+						{
+							Instance = execution,
+							Index = 0
+						}).ReturnValue;
 					IdentifyThread(thread, out ThreadInfo threadInfo);
 
 					executionStartedByClient = threadInfo.ParentControllerExecutionId == activeExecutionId;
@@ -2027,9 +2459,20 @@ namespace ExampleClient
 
 		private ExecutionsInstance GetAllOpenExecutions()
         {
+			// The Engine object does not have a property to get collection of executions
 			var applicationMgr = new ApplicationMgrInstance { Id = "ApplicationMgr" };
 
-			return _clients.ApplicationMgrClient.Get_Executions(new ApplicationMgr_Get_ExecutionsRequest { Instance = applicationMgr }).ReturnValue;
+			return _clients.ApplicationMgrClient.Get_Executions(
+				new ApplicationMgr_Get_ExecutionsRequest 
+				{
+					Instance = applicationMgr
+				}).ReturnValue;
+
+			// to iterate all executions in the returned collection, use ExecutionsClient.
+			// _clients.ExecutionsClient.Get_Count(new Executions_Get_CountRequest
+			// {
+			//		Instance = // executions instance
+			// });
 		}
 
 		private void OnListThreadsButtonClick(object sender, EventArgs e)

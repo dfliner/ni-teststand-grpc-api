@@ -331,6 +331,7 @@ namespace TestStandGrpcApi
             app.UseEndpoints(endpoints =>
             {
                 // Call RegisterServices for each Grpc api server side assembly you have generated and want to make available
+                // Register all server grpc services (integration with asp.net core)
                 ServicesRegistration.RegisterServices(endpoints);
             });
         }

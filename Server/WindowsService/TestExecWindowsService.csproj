@@ -81,12 +81,12 @@
     <ProjectReference Include="..\..\Grpc.Utilities\Grpc.Utilities.csproj" />
   </ItemGroup>
   <Target Name="PostBuild" AfterTargets="PostBuildEvent">
-	<Exec Command="xcopy /I /Y ..\CommonFiles\certs $(OutDir)\certs&#xD;&#xA;xcopy /I /Y ..\ExampleFiles $(OutDir)" />
+	  <Exec Command="xcopy /I /Y ..\CommonFiles\certs $(OutDir)\certs&#xD;&#xA;xcopy /I /Y ..\ExampleFiles $(OutDir)" />
   </Target>
   <Target Name="PostBuildPublish" AfterTargets="Publish">
-	<Exec Command="xcopy /I /Y ..\CommonFiles\certs $(PublishDir)\certs&#xD;&#xA;xcopy /I /Y ..\ExampleFiles $(PublishDir)" />
+	  <Exec Command="xcopy /I /Y ..\CommonFiles\certs $(PublishDir)\certs&#xD;&#xA;xcopy /I /Y ..\ExampleFiles $(PublishDir)" />
   </Target>
   <Target Name="PostBuildClean" AfterTargets="Clean">
-	<RemoveDir Directories="$(OutDir)" />
+	  <RemoveDir Directories="$(OutDir)" />
   </Target>
 </Project>

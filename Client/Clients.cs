@@ -37,6 +37,7 @@ namespace ExampleClient
         public InstanceLifetime.InstanceLifetimeClient InstanceLifetimeClient { get; private set; }
         public Engine.EngineClient EngineClient { get; private set; }
         public Step.StepClient StepClient { get; private set; }
+        public StepType.StepTypeClient StepTypeClient { get; private set; }
         public Execution.ExecutionClient ExecutionClient { get; private set; }
         public Report.ReportClient ReportClient { get; private set; }
         public Thread.ThreadClient ThreadClient { get; private set; }
@@ -54,6 +55,7 @@ namespace ExampleClient
             // clients for TestStand API interfaces we want to use
             EngineClient = new Engine.EngineClient(_gRPCChannel);
             StepClient = new Step.StepClient(_gRPCChannel);
+            StepTypeClient = new StepType.StepTypeClient(_gRPCChannel);
             ExecutionClient = new Execution.ExecutionClient(_gRPCChannel);
             ReportClient = new Report.ReportClient(_gRPCChannel);
             ThreadClient = new Thread.ThreadClient(_gRPCChannel);
